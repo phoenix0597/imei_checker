@@ -1,0 +1,540 @@
+
+
+- `models/user.py`:
+```
+from datetime import datetime
+from sqlalchemy import BigInteger, DateTime, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from src.core.database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tg_id: Mapped[int] = mapped_column(
+        BigInteger, unique=True, index=True, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self):
+        return f"User(id={self.id}, tg_id={self.tg_id}, created_at={self.created_at})"
+
+```
+
+
+- `bot/main.py`:
+```
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core.config import settings
+from src.core.database import get_session
+from src.bot.middlewares.auth import AuthMiddleware
+from src.bot.handlers import imei
+from src.core.logger import logger
+
+
+async def create_bot() -> Bot:
+    return Bot(
+        token=settings.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+
+async def create_dispatcher() -> Dispatcher:
+    dp = Dispatcher()
+    dp.message.middleware(AuthMiddleware())
+
+    dp.include_router(imei.router)
+
+    return dp
+
+
+async def main() -> None:
+    bot = await create_bot()
+    dp = await create_dispatcher()
+    try:
+        async with get_session() as session:
+            await dp.start_polling(bot, session=session)
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    asyncio.run(main())
+
+    logger.info("Bot stopped")
+
+```
+
+
+- `bot/handlers/imei.py`:
+```
+from aiogram import Router, F
+from aiogram.filters import Command
+from aiogram.types import Message
+from loguru import logger
+
+from src.api.controllers.imei import IMEIService
+from src.core.config import settings
+
+router = Router()
+
+
+@router.message(Command("start"))
+async def start(message: Message):
+    await message.answer(
+        "Добро пожаловать в IMEI Checker Bot!\nВведите IMEI для проверки."
+    )
+
+
+@router.message(F.text)
+async def check_imei(message: Message):
+    imei = message.text.strip()
+    try:
+        imei_service = IMEIService()
+        result = await imei_service.check_imei(
+            message.text, api_key=settings.IMEI_CHECK_API_KEY_LIVE
+        )
+        logger.info(f"IMEI check result: {result.model_dump()}")
+        response_text = result.model_dump()
+        await message.answer(str(response_text))
+
+    except Exception as e:
+        logger.error(f"Error checking IMEI {imei}^ ")
+
+```
+
+- `bot/middlewares/auth.py`:
+```
+from typing import Any, Callable, Awaitable, Dict
+
+from aiogram import BaseMiddleware
+from aiogram.types import Message
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.api.repositories.users import UserRepository
+from src.core.database import get_session
+
+
+class AuthMiddleware(BaseMiddleware):
+    def __init__(self):
+        self.user_repository = UserRepository(session=get_session())
+
+    async def __call__(
+        self,
+        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
+        event: Message,
+        data: Dict[str, Any],
+    ) -> Any:
+        session: AsyncSession = data["session"]
+        user_repo = UserRepository(session=session)
+
+        if not await user_repo.exists(event.from_user.id):
+            await event.answer(
+                "Извините, вы не имеете доступа к этому боту.\n"
+                "Пожалуйста, обратитесь к администратору."
+            )
+            return
+
+        return await handler(event, data)
+
+```
+
+
+- `api/main.py`:
+```
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+
+from src.api.controllers import (
+    # auth,
+    imei,
+)
+from src.core.logger import logger
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting up IMEI Checker API")
+    yield
+    logger.info("Shutting down IMEI Checker API")
+
+
+app = FastAPI(
+    title="IMEI Checker API",
+    description="API for checking IMEI numbers",
+    version="1.0.0",
+    lifespan=None,
+)
+
+# настройка CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# app.include_router(auth.router)
+app.include_router(imei.router)
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+```
+
+
+- `api/services/imei.py`:
+```
+from aiohttp import ClientSession, ClientError
+from loguru import logger
+from fastapi import HTTPException, status, Header
+
+from src.api.schemas.imei import IMEIDeviceInfo, IMEICheckError
+from src.core.config import settings
+
+
+class APIRequestMixin:
+    @staticmethod
+    def _get_headers(api_key: str) -> dict:
+        """Создает стандартные заголовки для запросов."""
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "Accept-Language": "en",
+            "Content-Type": "application/json",
+        }
+
+    @classmethod
+    async def _make_request(
+        cls,
+        method: str,
+        endpoint: str,
+        api_key: str,
+        base_url: str = settings.IMEI_CHECK_API_URL,
+        json_data: dict = None,
+    ) -> dict:
+        async with ClientSession() as session:
+            headers = cls._get_headers(api_key)
+            url = f"{base_url}/{endpoint}"
+
+            # Логируем детали запроса
+            logger.info(f"Making {method} request to: {url}")
+            logger.info(f"Headers: {headers}")
+            if json_data:
+                logger.info(f"Request body: {json_data}")
+
+            try:
+                async with session.request(
+                    method=method, url=url, headers=headers, json=json_data
+                ) as response:
+                    if response.status != 200:
+                        logger.error(
+                            f"Request failed response.text(): {await response.text()}"
+                        )
+
+                    return await response.json()
+
+            except ClientError as e:
+                logger.error(f"Request failed: {str(e)}")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Failed to fetch services: {str(e)}",
+                )
+
+
+class IMEIService(APIRequestMixin):
+
+    @classmethod
+    async def get_services(
+        cls, api_key: str = Header(default=settings.IMEI_CHECK_API_KEY_SANDBOX)
+    ) -> dict:
+        response = await cls._make_request("GET", "services", api_key=api_key)
+        logger.info(f"IMEI check result type: {type(response)}: {response}")
+        return response
+
+    @classmethod
+    async def check_imei(
+        cls,
+        imei: str,
+        api_key: str = Header(default=settings.IMEI_CHECK_API_KEY_SANDBOX),
+    ) -> IMEIDeviceInfo | IMEICheckError:
+
+        try:
+
+            services = await cls.get_services(api_key)
+            logger.info(f"IMEI check services: {services}")
+            service_id = services[0]["id"]
+            logger.info(f"Using service {service_id}")
+
+            check_data = {
+                "deviceId": imei,
+                "serviceId": service_id,
+            }
+
+            result = await cls._make_request(
+                "POST", "checks", api_key=api_key, json_data=check_data
+            )
+
+            # Если в ответе есть сообщение об ошибке
+            if "message" in result:
+                return IMEICheckError(**result)
+
+            # Если получены данные об устройстве
+            return IMEIDeviceInfo(**result)
+
+        except Exception as e:
+            # В случае любой ошибки возвращаем IMEICheckError
+            return IMEICheckError(message=str(e))
+
+```
+
+
+- `api/controllers/imei.py`:
+```
+from email.policy import default
+from typing import Union
+
+from fastapi import APIRouter, Header
+
+from src.api.services.imei import IMEIService
+from src.api.schemas.imei import IMEICheckRequest, IMEICheckResponse, IMEICheckError
+from src.core.logger import logger
+from src.core.config import settings
+
+
+router = APIRouter(
+    tags=["IMEI"],
+)
+
+
+@router.post("/api/check-imei", response_model=Union[IMEICheckError, IMEICheckResponse])
+async def check_imei(
+    request: IMEICheckRequest,
+    api_key: str = Header(default=settings.IMEI_CHECK_API_KEY_SANDBOX),
+):
+
+    imei_service = IMEIService()
+    result = await imei_service.check_imei(request.imei, api_key)
+
+    logger.info(f"IMEI check result: {result.model_dump()}")
+
+    if isinstance(result, IMEICheckError):
+        return result.model_dump()
+
+    return IMEICheckResponse(status=result.status, device_data=result).model_dump()
+
+```
+
+- `api/repositories/users.py`:
+```
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.models.user import User
+from src.core.logger import logger
+
+
+class UserRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get_user_by_tg_id(self, tg_id: int) -> User:
+        query = select(User).where(User.tg_id == tg_id)
+        logger.info(f"Executing query: {query} for tg_id: {tg_id}")
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
+
+    async def get_all(self) -> list[User]:
+        query = select(User)
+        result = await self.session.execute(query)
+        return list(result.scalars().all())
+
+    async def exists(self, tg_id: int) -> bool:
+        user = await self.get_user_by_tg_id(tg_id)
+        return user is not None
+
+```
+
+
+- `api/schemas/auth.py`:
+```
+from pydantic import BaseModel
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class TokenData(BaseModel):
+    api_key: str
+
+```
+
+
+- `api/schemas/imei.py`:
+```
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+class IMEICheckRequest(BaseModel):
+    imei: str = Field(..., min_length=8, max_length=15)
+    token: str
+
+
+class IMEIDeviceInfo(BaseModel):
+    deviceName: Optional[str] = None
+    image: Optional[str] = None
+    imei: str
+    estPurchaseDate: Optional[int] = None
+    simLock: Optional[bool] = None
+    warrantyStatus: Optional[str] = None
+    repairCoverage: Optional[str] = None
+    technicalSupport: Optional[str] = None
+    modelDesc: Optional[str] = None
+    demoUnit: Optional[bool] = None
+    refurbished: Optional[str] = None
+    purchaseCountry: Optional[str] = None
+    apple_region: Optional[str] = Field(None, alias="apple/region")
+    fmiOn: Optional[str] = None
+    lostMode: Optional[str] = None
+    usaBlockStatus: Optional[str] = None
+    network: Optional[str] = None
+
+
+class IMEICheckResponse(BaseModel):
+    status: str
+    device_data: IMEIDeviceInfo
+
+
+class IMEICheckError(BaseModel):
+    message: str
+
+```
+
+- `core/database.py`:
+```
+from contextlib import asynccontextmanager
+
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import DeclarativeBase
+
+from src.core.config import settings
+
+engine = create_async_engine(settings.DATABASE_URL, echo=True)
+
+async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+@asynccontextmanager
+async def get_session() -> AsyncSession:
+    async with async_session() as session:
+        yield session
+
+```
+
+- `core/logger.py`:
+```
+import sys
+from os.path import join
+from src.core.config import settings
+
+from loguru import logger
+
+
+def setup_logging():
+    logger.remove()
+
+    # настройки логирования в консоль
+    logger.add(
+        sys.stdout,
+        format="{time: YYYY-MM-DD HH:mm:ss} | {level} | {module}: {message}",
+        level="INFO",
+        colorize=True,
+    )
+
+    # настройки логирования в файл
+    logger.add(
+        join(settings.BASE_DIR, "logs", "app.log"),
+        format="{time: YYYY-MM-DD HH:mm:ss} | {level} | {module}: {message}",
+        level="INFO",
+        colorize=True,
+        rotation="500 MB",
+        compression="zip",
+    )
+
+```
+
+- `core/config.py`:
+```
+from os.path import abspath, dirname, join
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    # Database
+    DATABASE_URL: str
+
+    # Telegram
+    BOT_TOKEN: str
+
+    # API
+    API_TOKEN: str
+    IMEI_CHECK_API_KEY_SANDBOX: str
+    IMEI_CHECK_API_KEY_LIVE: str
+    IMEI_CHECK_API_URL: str = "https://api.imeicheck.net/v1"
+
+    # Security
+    API_TOKEN_EXPIRE_MINUTES: int = 30
+    SECRET_KEY: str
+
+    BASE_DIR: str = abspath(dirname(dirname(dirname(__file__))))
+    ENV_FILE_PATH: str = join(BASE_DIR, ".env")
+
+    model_config = SettingsConfigDict(env_file=ENV_FILE_PATH, extra="ignore")
+
+
+settings = Settings()  # type: ignore
+
+```
+
+- `core/users.csv`:
+```
+12345678
+87654321
+11111111
+
+```
+
+- `core/users.sql`:
+```
+-- вставить нужные tg_id
+INSERT INTO users (tg_id)
+VALUES (12345678),
+       (34799846),
+       (507777625);
+```
+
+
