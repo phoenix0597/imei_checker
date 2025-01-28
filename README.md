@@ -3,7 +3,7 @@
 ### 1. Клонируйте репозиторий
 
 ```bash
-git clone https://github.com/oleg-rybakov/telegram_bot.git
+git clone https://github.com/phoenix0597/imei_checker.git
 ```
 
 ### 2. Создайте файл .env по примеру .env.example и заполните его корректными данными, где:
